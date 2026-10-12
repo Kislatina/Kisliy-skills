@@ -9,6 +9,7 @@ A collection of [Claude Code](https://code.claude.com/docs/en/skills) skills by 
 | [`offstage`](./offstage) | Run a macOS app on a hidden virtual display, screenshot it and drive its UI — without touching your screen, cursor, or focus. | [`offstage/SKILL.md`](./offstage/SKILL.md) |
 | [`motion-film`](./motion-film) | Make a finished, showreel-grade motion-graphics video entirely in code — procedural visuals, synthesized score, mastered MP4. | [`motion-film/SKILL.md`](./motion-film/SKILL.md) |
 | [`nullnote`](./nullnote) | Author `.nn` (NullNote) files — interactive documents with callouts, charts, diagrams, and buttons that run shell commands. | [`nullnote/SKILL.md`](./nullnote/SKILL.md) |
+| [`local-jev`](./local-jev) | A local, offline analogue of the Jev decision model — typed choice / score / yes-no decisions with probabilities and confidence, powered by 10 local models via Ollama. | [`local-jev/SKILL.md`](./local-jev/SKILL.md) |
 
 ### offstage
 
@@ -36,6 +37,12 @@ Plain-text `.nn` format: YAML frontmatter + extended Markdown. Rendered live by 
 
 Supports: callouts, charts, diagrams, data blocks, and buttons that run real shell commands. See [`nullnote/SKILL.md`](./nullnote/SKILL.md).
 
+### local-jev
+
+A local [System One](https://docs.typesafe.ai/concepts/system-one)-style decision engine. Claude Code gets fast, private, free typed decisions — `choose`, `score`, `yesno`, batch `ask`, multi-model `panel`, `guard`, and a `think` escalation — each with per-option probabilities and a confidence to gate on. Ten curated local models (Qwen3, Gemma 3, Phi-4, Llama 3.2, Granite, Granite Guardian), one-line setup: `jev setup`.
+
+Requires: macOS or Linux, Python 3.9+, [Ollama](https://ollama.com) (installed by `jev setup`).
+
 ## Install
 
 Copy the skills you need into your Claude skills dir:
@@ -44,6 +51,7 @@ Copy the skills you need into your Claude skills dir:
 cp -R offstage ~/.claude/skills/offstage
 cp -R motion-film ~/.claude/skills/motion-film
 cp -R nullnote ~/.claude/skills/nullnote
+cp -R local-jev ~/.claude/skills/local-jev
 ```
 
 Or symlink them so updates come in with `git pull`:
@@ -52,6 +60,7 @@ Or symlink them so updates come in with `git pull`:
 ln -s "$(pwd)/offstage" ~/.claude/skills/offstage
 ln -s "$(pwd)/motion-film" ~/.claude/skills/motion-film
 ln -s "$(pwd)/nullnote" ~/.claude/skills/nullnote
+ln -s "$(pwd)/local-jev" ~/.claude/skills/local-jev
 ```
 
 Rebuild `offstage` if the binary is missing:
@@ -73,6 +82,7 @@ Kisliy-skills/
 ├── offstage/       # skill + Swift tool (see offstage/README.md for maintainers)
 ├── motion-film/    # skill
 ├── nullnote/       # skill
+├── local-jev/      # skill + `jev` CLI (Python, stdlib only)
 ├── LICENSE         # MIT
 └── README.md
 ```
