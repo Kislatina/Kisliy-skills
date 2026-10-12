@@ -49,7 +49,7 @@ CATALOG = [
      "why": "Best language/retrieval skills; strong on search-relevance and ranking decisions. 32 GB+."},
     {"key": "d3-flash", "name": "vLLM-SR d3-flash (9B)", "repo": "ggml-org/vllm-d3-flash-GGUF", "quant": "Q4_K_M",
      "index": 55.8, "gb": 6.6, "ram": 12, "license": "Apache-2.0", "images": True,
-     "why": "DEFAULT. Best model that fits a 16 GB Mac; ~50 ms/decision class, near hosted-Jev quality."},
+     "why": "DEFAULT. Best model that fits a 16 GB Mac; ~0.6 s per decision measured on an M-series Mac, near hosted-Jev quality."},
     {"key": "nimble", "name": "Bespoke Nimble v3 (9B)", "repo": "ggml-org/Bespoke-Nimble-9B-v3-GGUF", "quant": "Q4_K_M",
      "index": 54.7, "gb": 6.3, "ram": 12, "license": "CC-BY-NC-4.0 (non-commercial)", "images": False,
      "why": "Close second at 9B with a fully open recipe; personal/research use only."},
