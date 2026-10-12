@@ -1,65 +1,79 @@
 #!/usr/bin/env python3
-"""jev — a local System One decision engine for Claude Code.
+"""jev — local System One decision models for Claude Code.
 
-Typed decisions (choice / score / yes-no) with per-option probabilities and a
-confidence number, computed on this Mac by a small local LLM served by Ollama.
-The model never writes prose: it is asked for ONE label and we read the
-probability distribution over the labels from its first-token logprobs.
+A thin client + server manager for native *decision models* (vLLM-SR d3,
+Perplexity Decider, Cloudflare Clef, Kev, Laya, LiquidAI d1 ...) served by
+llama.cpp's TypeSafe-compatible `POST /v1/systemone` endpoint. A decision model
+does not generate text: one forward pass returns a typed answer (choice /
+score / noul) with calibrated probabilities and a confidence.
 
 Python 3.9+, standard library only.
 """
 import argparse
 import concurrent.futures as cf
+import glob
 import json
 import math
 import os
+import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 
-HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-if not HOST.startswith("http"):
-    HOST = "http://" + HOST
-CONFIG = os.path.expanduser("~/.config/local-jev/config.json")
-KEEP_ALIVE = os.environ.get("JEV_KEEP_ALIVE", "30m")
+PORT = int(os.environ.get("JEV_PORT", "9931"))
+URL = os.environ.get("JEV_URL", "http://127.0.0.1:%d" % PORT).rstrip("/")
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local/state/local-jev")
+SHARE_DIR = os.path.join(HOME, ".local/share/local-jev")
+CONFIG = os.path.join(HOME, ".config/local-jev/config.json")
+HF_CACHE = os.environ.get("HF_HUB_CACHE") or os.path.join(os.environ.get("HF_HOME", os.path.join(HOME, ".cache/huggingface")), "hub")
 
 # --------------------------------------------------------------------------
-# Catalog: the ten local decision models.  tier: reflex < core < specialist.
+# Catalog: the ten best open decision models you can run locally.
+# `index` = Decision Index 0.3 "v" score (huggingface.co/spaces/multimodalart/jev-decision-index,
+# board of 2026-10-06; TypeSafe's hosted Jev 1.13 scores 60.1 on the same board).
 # --------------------------------------------------------------------------
 CATALOG = [
-    {"id": "llama3.2:3b", "name": "Llama 3.2 3B", "gb": 2.0, "ram": 6, "tier": "reflex",
-     "why": "Fastest sane router. Intent routing, language/spam/topic tagging on 8 GB Macs."},
-    {"id": "qwen3:4b-instruct-2507-q4_K_M", "name": "Qwen3 4B Instruct 2507", "gb": 2.5, "ram": 8, "tier": "reflex",
-     "why": "Best accuracy under 3 GB; follows label-only instructions and holds up on multilingual text."},
-    {"id": "phi4-mini:3.8b", "name": "Phi-4 mini 3.8B", "gb": 2.5, "ram": 8, "tier": "reflex",
-     "why": "Strong at logic-flavoured yes/no checks, rubrics and code-adjacent questions for its size."},
-    {"id": "gemma3:4b", "name": "Gemma 3 4B", "gb": 3.4, "ram": 8, "tier": "reflex",
-     "why": "Well-calibrated probabilities for its size; good second voice in a panel."},
-    {"id": "qwen3:8b", "name": "Qwen3 8B", "gb": 5.2, "ram": 12, "tier": "core",
-     "why": "The default. Best all-round balance of accuracy, calibration and ~0.3 s decisions on Apple Silicon."},
-    {"id": "granite3.3:8b", "name": "IBM Granite 3.3 8B", "gb": 4.9, "ram": 12, "tier": "core",
-     "why": "Enterprise-tuned for classification, extraction and policy checks; very terse and predictable."},
-    {"id": "gemma3:12b", "name": "Gemma 3 12B", "gb": 8.2, "ram": 16, "tier": "core",
-     "why": "Nuanced scoring and tone/sentiment rubrics; strongest non-Chinese-lab model in this size band."},
-    {"id": "qwen3:14b", "name": "Qwen3 14B", "gb": 9.3, "ram": 24, "tier": "core",
-     "why": "Highest accuracy of the single-model picks; use when a wrong decision is expensive."},
-    {"id": "phi4:14b", "name": "Phi-4 14B", "gb": 9.1, "ram": 24, "tier": "core",
-     "why": "Excellent on reasoning-heavy gates (is this diff safe, does the evidence support the claim)."},
-    {"id": "granite3-guardian:8b", "name": "Granite Guardian 3 8B", "gb": 5.8, "ram": 12, "tier": "specialist",
-     "why": "Purpose-built risk detector: harm, jailbreak, bias, violence, profanity. Use via `jev guard`."},
+    {"key": "d3", "name": "vLLM-SR d3 (27B)", "repo": "ggml-org/vllm-d3-GGUF", "quant": "Q4_K_M",
+     "index": 66.3, "gb": 19.4, "ram": 32, "license": "Apache-2.0", "images": True,
+     "why": "#1 on the Decision Index, ahead of hosted Jev. Use when a wrong call is expensive and you have 32 GB+."},
+    {"key": "pplx", "name": "Perplexity Decider v1.1 (27B)", "repo": "Livesport/pplx-decider-v1.1-27b-GGUF",
+     "file": "pplx-decider-v1.1-27b-Q5_K_M-dyn.gguf", "index": 62.8, "gb": 19.6, "ram": 32,
+     "license": "Apache-2.0", "images": True,
+     "why": "Best language/retrieval skills; strong on search-relevance and ranking decisions. 32 GB+."},
+    {"key": "d3-flash", "name": "vLLM-SR d3-flash (9B)", "repo": "ggml-org/vllm-d3-flash-GGUF", "quant": "Q4_K_M",
+     "index": 55.8, "gb": 6.6, "ram": 12, "license": "Apache-2.0", "images": True,
+     "why": "DEFAULT. Best model that fits a 16 GB Mac; ~50 ms/decision class, near hosted-Jev quality."},
+    {"key": "nimble", "name": "Bespoke Nimble v3 (9B)", "repo": "ggml-org/Bespoke-Nimble-9B-v3-GGUF", "quant": "Q4_K_M",
+     "index": 54.7, "gb": 6.3, "ram": 12, "license": "CC-BY-NC-4.0 (non-commercial)", "images": False,
+     "why": "Close second at 9B with a fully open recipe; personal/research use only."},
+    {"key": "d3-mini", "name": "vLLM-SR d3-mini (4B)", "repo": "ggml-org/vllm-d3-mini-GGUF", "quant": "Q4_K_M",
+     "index": 52.6, "gb": 3.7, "ram": 8, "license": "Apache-2.0", "images": True,
+     "why": "Best under 4 GB: 8 GB Macs, or when you want decisions without evicting your other apps."},
+    {"key": "clef-flash", "name": "Cloudflare clef-flash (9B)", "repo": "ggml-org/Clef-Flash-GGUF", "quant": "Q4_K_M",
+     "index": 47.6, "gb": 6.5, "ram": 12, "license": "Apache-2.0", "images": True,
+     "why": "Reads all questions jointly in one prompt; very strong on public benchmarks (56.1), takes images."},
+    {"key": "kev-9b", "name": "Kev 9B", "repo": "ggml-org/Kev-9B-GGUF", "quant": "Q4_K_M",
+     "index": 43.3, "gb": 6.4, "ram": 12, "license": "Apache-2.0", "images": False,
+     "why": "The reference open reimplementation of TypeSafe's API; best-documented behaviour."},
+    {"key": "d1-3b", "name": "LiquidAI d1-3B", "repo": "LiquidAI/d1-3B-GGUF", "quant": "Q4_K_M",
+     "index": 38.9, "gb": 1.7, "ram": 6, "license": "LFM Open License", "images": True,
+     "why": "1.7 GB, multimodal (text+image state), 49.0 on public benchmarks; ideal always-on reflex."},
+    {"key": "d3-nano", "name": "vLLM-SR d3-nano (2B)", "repo": "ggml-org/vllm-d3-nano-GGUF", "quant": "Q8_0",
+     "index": 38.9, "gb": 2.6, "ram": 6, "license": "Apache-2.0", "images": True,
+     "why": "Tiny and fast; bulk tagging of thousands of items on any Mac."},
+    {"key": "laya", "name": "Laya (0.4B, multilingual)", "repo": "ggml-org/Laya-GGUF", "quant": "Q8_0",
+     "index": 4.4, "gb": 0.45, "ram": 4, "license": "Apache-2.0", "images": False,
+     "why": "~30 ms, 100+ languages, 8k context; the cheapest router. Weak on out-of-domain skills — use for routing/classification only."},
 ]
-# System-2 companions: slow reasoning models, used with `jev think` (not logprob decisions).
-THINKERS = [
-    {"id": "deepseek-r1:14b", "name": "DeepSeek-R1 14B", "gb": 9.0, "ram": 24},
-    {"id": "deepseek-r1:8b", "name": "DeepSeek-R1 8B", "gb": 5.2, "ram": 12},
-    {"id": "gpt-oss:20b", "name": "gpt-oss 20B", "gb": 13.8, "ram": 24},
-]
-ALIASES = {"tiny": "llama3.2:3b", "fast": "qwen3:4b-instruct-2507-q4_K_M", "default": "qwen3:8b",
-           "best": "qwen3:14b", "guard": "granite3-guardian:8b", "think": "deepseek-r1:8b"}
+ALIASES = {"default": "d3-flash", "best": "d3", "fast": "d3-mini", "tiny": "laya", "multilingual": "laya",
+           "reflex": "d1-3b", "perplexity": "pplx", "clef": "clef-flash", "kev": "kev-9b"}
 
 
 def die(msg, code=1):
@@ -69,9 +83,20 @@ def die(msg, code=1):
 
 def ram_gb():
     try:
-        return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip()) / 2 ** 30
+        if sys.platform == "darwin":
+            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip()) / 2 ** 30
+        with open("/proc/meminfo") as f:
+            return int(f.readline().split()[1]) / 2 ** 20
     except Exception:
         return 0.0
+
+
+def entry(name):
+    name = ALIASES.get(name, name)
+    for m in CATALOG:
+        if m["key"] == name or m["repo"].lower() == name.lower():
+            return m
+    die("unknown model '%s'. See: jev models" % name)
 
 
 def load_config():
@@ -82,235 +107,212 @@ def load_config():
         return {}
 
 
-def default_model():
-    env = os.environ.get("JEV_MODEL")
-    if env:
-        return resolve(env)
+def default_key():
+    if os.environ.get("JEV_MODEL"):
+        return entry(os.environ["JEV_MODEL"])["key"]
     cfg = load_config().get("model")
-    if cfg:
+    if cfg and any(m["key"] == cfg for m in CATALOG):
         return cfg
     r = ram_gb()
-    if r >= 32:
-        return "qwen3:14b"
-    if r >= 12:
-        return "qwen3:8b"
-    return "qwen3:4b-instruct-2507-q4_K_M"
+    if r >= 30:
+        return "d3"
+    if r >= 11:
+        return "d3-flash"
+    if r >= 7:
+        return "d3-mini"
+    return "d3-nano"
 
 
-def resolve(name):
-    return ALIASES.get(name, name)
+def cached(m):
+    d = os.path.join(HF_CACHE, "models--" + m["repo"].replace("/", "--"), "snapshots")
+    want = m.get("file") or ("-" + m.get("quant", "") + ".gguf")
+    for p in glob.glob(os.path.join(d, "*", "*.gguf")):
+        b = os.path.basename(p)
+        if "mmproj" in b:
+            continue
+        if (m.get("file") and b == m["file"]) or (not m.get("file") and b.endswith(want)):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------
-# Ollama HTTP
+# Server management (llama.cpp llama-server with /v1/systemone)
 # --------------------------------------------------------------------------
-def http(path, body=None, timeout=120):
+def llama_server_bin():
+    if os.environ.get("JEV_LLAMA_SERVER"):
+        return os.environ["JEV_LLAMA_SERVER"]
+    found = sorted(glob.glob(os.path.join(SHARE_DIR, "llama-*", "**", "llama-server"), recursive=True), reverse=True)
+    if found:
+        return found[0]
+    return shutil.which("llama-server")
+
+
+def http(path, body=None, timeout=60):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(HOST + path, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(URL + path, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
-def server_up():
+def healthy():
     try:
-        http("/api/version", timeout=2)
-        return True
+        return http("/health", timeout=2).get("status") == "ok"
     except Exception:
         return False
 
 
-def installed_models():
+def running_info():
     try:
-        return [m["name"] for m in http("/api/tags", timeout=3).get("models", [])]
+        with open(os.path.join(STATE_DIR, "server.json")) as f:
+            return json.load(f)
     except Exception:
-        return []
+        return {}
 
 
-def has_model(tag, installed):
-    return any(i == tag or i == tag + ":latest" or (":" not in tag and i.startswith(tag + ":")) for i in installed)
-
-
-def chat(model, messages, num_predict=1, logprobs=True, think=False, timeout=180):
-    body = {"model": model, "messages": messages, "stream": False, "keep_alive": KEEP_ALIVE,
-            "options": {"temperature": 0, "seed": 7, "num_predict": num_predict}}
-    if logprobs:
-        body["logprobs"] = True
-        body["top_logprobs"] = 20
-    if think is not None:
-        body["think"] = think
-    try:
-        return http("/api/chat", body, timeout)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")
-        if e.code == 400 and "think" in detail and "think" in body:
-            body.pop("think")  # model has no thinking switch
-            return http("/api/chat", body, timeout)
-        if e.code == 404:
-            die("model '%s' is not installed. Run: jev pull %s" % (model, model), 4)
-        die("ollama error %s: %s" % (e.code, detail[:300]))
-    except urllib.error.URLError:
-        die("Ollama is not running at %s. Run: jev setup" % HOST, 4)
-
-
-def first_token_logprobs(resp):
-    lp = resp.get("logprobs")
-    if lp is None:
-        lp = (resp.get("message") or {}).get("logprobs")
-    if not lp:
-        return None
-    first = lp[0]
-    tops = first.get("top_logprobs") or [first]
-    return [(t.get("token", ""), t.get("logprob", -99.0)) for t in tops]
-
-
-# --------------------------------------------------------------------------
-# The decision core
-# --------------------------------------------------------------------------
-SYSTEM = ("You are a fast decision engine inside a software pipeline. Read the STATE, then answer the QUESTION by "
-          "replying with exactly one label from the list and nothing else. Never explain.")
-
-
-def render_state(state):
-    if isinstance(state, str):
-        return state.strip()
-    return json.dumps(state, ensure_ascii=False, indent=2)
-
-
-def distribution(model, state, question, labels, lines, instructions=None, word_labels=False):
-    """Return (probs{label:p}, mass_on_valid_labels, raw_text)."""
-    sys_text = SYSTEM + ("\n" + instructions.strip() if instructions else "")
-    user = "STATE:\n%s\n\nQUESTION: %s\n\nLABELS:\n%s\n\nAnswer with the label only." % (
-        render_state(state), question, "\n".join(lines))
-    resp = chat(model, [{"role": "system", "content": sys_text}, {"role": "user", "content": user}])
-    text = ((resp.get("message") or {}).get("content") or "").strip()
-    tops = first_token_logprobs(resp)
-    raw = {l: 0.0 for l in labels}
-    if tops:
-        for tok, lp in tops:
-            t = tok.strip()
-            for l in labels:
-                if (t.lower() == l.lower()) if word_labels else (t == l):
-                    raw[l] += math.exp(lp)
-                    break
-    mass = sum(raw.values())
-    if mass < 0.2:
-        # No usable logprobs (old Ollama / odd tokenizer): fall back to the written answer.
-        retry = chat(model, [{"role": "system", "content": sys_text}, {"role": "user", "content": user}],
-                     num_predict=12, logprobs=False)
-        text = ((retry.get("message") or {}).get("content") or "").strip()
-        head = re.sub(r"^[^\w]+", "", text)
-        for l in labels:
-            if head.lower().startswith(l.lower()):
-                raw = {k: (1.0 if k == l else 0.0) for k in labels}
-                mass = 0.0
+def stop_server():
+    info = running_info()
+    pid = info.get("pid")
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(40):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.25)
+            except OSError:
                 break
-    total = sum(raw.values())
-    if total <= 0:
-        return None, 0.0, text
-    return {l: raw[l] / total for l in labels}, min(1.0, mass), text
+    try:
+        os.remove(os.path.join(STATE_DIR, "server.json"))
+    except OSError:
+        pass
 
 
+def start_server(m, quiet=False, wait=1800):
+    exe = llama_server_bin()
+    if not exe:
+        die("no llama-server found. Run: jev setup")
+    if "localhost" not in URL and "127.0.0.1" not in URL:
+        die("JEV_URL points to a remote server; start the model there")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    stop_server()
+    cmd = [exe, "--host", "127.0.0.1", "--port", str(PORT), "--alias", "jev",
+           "--ubatch-size", "4096", "--batch-size", "4096", "-c", "8192"]
+    if not os.environ.get("JEV_MMPROJ"):  # text-only by default: saves RAM and a download
+        cmd.append("--no-mmproj")
+    if m.get("file"):
+        cmd += ["-hf", m["repo"], "--hf-file", m["file"]]
+    else:
+        cmd += ["-hf", "%s:%s" % (m["repo"], m["quant"])]
+    cmd += os.environ.get("JEV_SERVER_ARGS", "").split()
+    log = os.path.join(STATE_DIR, "server.log")
+    lf = open(log, "w")
+    p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+    with open(os.path.join(STATE_DIR, "server.json"), "w") as f:
+        json.dump({"pid": p.pid, "key": m["key"], "repo": m["repo"], "started": time.time()}, f)
+    t0, last = time.time(), 0
+    while time.time() - t0 < wait:
+        if p.poll() is not None:
+            tail = open(log).read()[-600:]
+            hint = " Update the runtime: jev setup --update" if "unsupported decision model" in tail else ""
+            die("llama-server exited while loading %s.%s\n%s" % (m["key"], hint, tail))
+        if healthy():
+            return
+        if not quiet and time.time() - last > 15:
+            last = time.time()
+            print("… loading %s (first run downloads %.1f GB)" % (m["name"], m["gb"]), file=sys.stderr)
+        time.sleep(1)
+    die("timed out waiting for the server; see " + log)
+
+
+def ensure(model=None):
+    """Make sure a server with the wanted model answers; start/switch it if needed."""
+    if "localhost" not in URL and "127.0.0.1" not in URL:
+        if not healthy():
+            die("remote server %s is not reachable" % URL, 4)
+        return
+    want = entry(model) if model else None
+    info = running_info()
+    if healthy() and (want is None or info.get("key") in (None, want["key"])):
+        return
+    m = want or entry(default_key())
+    start_server(m)
+
+
+def call(state, questions, model=None, files=None):
+    ensure(model)
+    body = {"state": state, "questions": questions}
+    if files:
+        body["files"] = files
+    try:
+        return http("/v1/systemone", body, timeout=300)
+    except urllib.error.HTTPError as e:
+        die("server error %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:400]))
+    except urllib.error.URLError as e:
+        die("cannot reach %s (%s). Run: jev serve" % (URL, e.reason), 4)
+
+
+# --------------------------------------------------------------------------
+# Primitives
+# --------------------------------------------------------------------------
 def conf_choice(ps):
     n = len(ps)
-    if n < 2:
-        return 1.0
-    return max(0.0, min(1.0, (n * max(ps) - 1) / (n - 1)))
-
-
-def conf_score(ps):
-    n = len(ps)
-    peak = ps.index(max(ps))
-    spread = sum(p * abs(i - peak) for i, p in enumerate(ps))
-    even = sum(abs(i - (n - 1) / 2.0) for i in range(n)) / n
-    return max(0.0, min(1.0, 1 - spread / even)) if even else 1.0
+    return max(0.0, min(1.0, (n * max(ps) - 1) / (n - 1))) if n > 1 else 1.0
 
 
 def norm_options(options):
-    """Accept ['a','b'] or {'a': 'description', ...} -> (names, descriptions)."""
     if isinstance(options, dict):
-        return list(options.keys()), [str(v) for v in options.values()]
-    names = [str(o) for o in options]
-    return names, [""] * len(names)
+        return {str(k): (str(v) if v else None) for k, v in options.items()}
+    return {str(o): None for o in options}
 
 
-def letters(n):
-    return [chr(ord("A") + i) for i in range(n)]
+def q_choice(question, options, instructions=None):
+    q = {"type": "choice", "instructions": question, "criteria": norm_options(options)}
+    if instructions:
+        q["instructions"] = question + "\n" + instructions
+    return q
 
 
-def do_choice(model, state, question, options, instructions=None, debias=False):
-    names, descs = norm_options(options)
-    if len(names) < 2 or len(names) > 26:
-        die("choice needs 2-26 options")
-    runs = [list(range(len(names)))]
-    if debias:
-        runs.append(list(reversed(range(len(names)))))
-    acc = [0.0] * len(names)
-    mass_sum, text = 0.0, ""
-    for order in runs:
-        labs = letters(len(names))
-        lines = []
-        for slot, idx in enumerate(order):
-            lines.append("%s) %s%s" % (labs[slot], names[idx], (" — " + descs[idx]) if descs[idx] else ""))
-        probs, mass, text = distribution(model, state, question, labs, lines, instructions)
-        if probs is None:
-            return {"type": "choice", "choice": None, "error": "model gave no usable answer", "raw": text}
-        for slot, idx in enumerate(order):
-            acc[idx] += probs[labs[slot]] / len(runs)
-        mass_sum += mass / len(runs)
-    ps = acc
-    best = max(range(len(ps)), key=lambda i: ps[i])
-    return {"type": "choice", "choice": names[best],
-            "probabilities": {n: round(p, 4) for n, p in zip(names, ps)},
-            "confidence": round(conf_choice(ps), 4), "label_mass": round(mass_sum, 3)}
+def q_score(question, levels, instructions=None):
+    lv = list(levels.keys()) if isinstance(levels, dict) else list(levels)
+    if isinstance(levels, dict):
+        lv = ["%s: %s" % (k, v) if v else k for k, v in levels.items()]
+    q = {"type": "score", "instructions": question, "criteria": lv}
+    if instructions:
+        q["instructions"] = question + "\n" + instructions
+    return q
 
 
-def do_score(model, state, question, levels, instructions=None):
-    names, descs = norm_options(levels)
-    if len(names) < 2 or len(names) > 10:
-        die("score needs 2-10 levels")
-    labs = [str(i) for i in range(len(names))]
-    lines = ["%d = %s%s" % (i, names[i], (" — " + descs[i]) if descs[i] else "") for i in range(len(names))]
-    probs, mass, text = distribution(model, state, question, labs, lines, instructions)
-    if probs is None:
-        return {"type": "score", "score": None, "error": "model gave no usable answer", "raw": text}
-    ps = [probs[l] for l in labs]
-    return {"type": "score", "score": round(sum(i * p for i, p in enumerate(ps)), 3),
-            "level": max(range(len(ps)), key=lambda i: ps[i]), "levels": names,
-            "probabilities": {str(i): round(p, 4) for i, p in enumerate(ps)},
-            "confidence": round(conf_score(ps), 4), "label_mass": round(mass, 3)}
+def q_noul(statement, instructions=None):
+    q = {"type": "noul", "instructions": statement}
+    if instructions:
+        q["instructions"] = statement + "\n" + instructions
+    return q
 
 
-def do_noul(model, state, statement, instructions=None):
-    q = "Is the following statement true of the STATE? Statement: " + statement
-    probs, mass, text = distribution(model, state, q, ["Yes", "No"], ["Yes — the statement is true", "No — it is not"],
-                                     instructions, word_labels=True)
-    if probs is None:
-        return {"type": "noul", "noul": None, "error": "model gave no usable answer", "raw": text}
-    return {"type": "noul", "noul": round(probs["Yes"], 4), "answer": probs["Yes"] >= 0.5,
-            "confidence": round(conf_choice([probs["Yes"], probs["No"]]), 4), "label_mass": round(mass, 3)}
-
-
-def run_question(model, state, q, debias=False):
-    t = q.get("type", "choice")
-    ins = q.get("instructions")
+def tidy(qid, ans):
+    t = ans.get("type")
     if t == "choice":
-        out = do_choice(model, state, q["question"], q["options"], ins, q.get("debias", debias))
+        out = {"type": "choice", "choice": ans["choice"],
+               "probabilities": {k: round(v, 4) for k, v in ans["probabilities"].items()},
+               "confidence": round(ans.get("confidence", conf_choice(list(ans["probabilities"].values()))), 4)}
     elif t == "score":
-        out = do_score(model, state, q["question"], q["levels"], ins)
-    elif t in ("noul", "yesno"):
-        out = do_noul(model, state, q.get("statement") or q["question"], ins)
+        ps = [ans["probabilities"][k] for k in sorted(ans["probabilities"], key=int)]
+        out = {"type": "score", "score": round(ans["score"], 3), "level": ps.index(max(ps)),
+               "legend": ans.get("legend"), "probabilities": {k: round(v, 4) for k, v in ans["probabilities"].items()},
+               "confidence": round(ans.get("confidence", 0.0), 4)}
     else:
-        die("unknown question type: %s" % t)
-    if "id" in q:
-        out["id"] = q["id"]
+        p = ans.get("noul", ans.get("probability"))
+        out = {"type": "noul", "noul": round(p, 4), "answer": p >= 0.5, "confidence": round(abs(2 * p - 1), 4)}
+    if qid:
+        out["id"] = qid
     return out
 
 
 def gate(out, min_conf):
-    if min_conf is None:
-        return out
-    c = out.get("confidence")
-    out["action"] = "act" if (c is not None and c >= min_conf) else "escalate"
+    if min_conf is not None:
+        out["action"] = "act" if out.get("confidence", 0) >= min_conf else "escalate"
     return out
 
 
@@ -319,77 +321,85 @@ def emit(obj, code=0):
     sys.exit(code)
 
 
-def read_state(args):
-    if getattr(args, "state_file", None):
-        with open(args.state_file) as f:
-            txt = f.read()
-    elif getattr(args, "state", None) is not None:
-        txt = args.state
+def read_state(a):
+    if getattr(a, "state_file", None):
+        txt = open(a.state_file).read()
+    elif getattr(a, "state", None) is not None:
+        txt = a.state
     elif not sys.stdin.isatty():
         txt = sys.stdin.read()
     else:
         die("no state: pass --state, --state-file or pipe it on stdin")
     try:
-        parsed = json.loads(txt)
-        if isinstance(parsed, (dict, list)):
-            return parsed
+        v = json.loads(txt)
+        if isinstance(v, (dict, list)):
+            return v
     except Exception:
         pass
     return txt
+
+
+def one(a, question):
+    state = read_state(a)
+    res = call(state, {"q": question}, a.model)
+    out = gate(tidy(None, res["answers"]["q"]), a.min_confidence)
+    out["model"] = (running_info().get("key") or a.model or default_key())
+    emit(out, 3 if out.get("action") == "escalate" else 0)
 
 
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 def cmd_choose(a):
-    state = read_state(a)
-    out = do_choice(resolve(a.model) if a.model else default_model(), state, a.question, a.option, a.instructions, a.debias)
-    out = gate(out, a.min_confidence)
-    emit(out, 3 if out.get("action") == "escalate" else 0)
+    one(a, q_choice(a.question, a.option, a.instructions))
 
 
 def cmd_score(a):
-    state = read_state(a)
-    out = do_score(resolve(a.model) if a.model else default_model(), state, a.question, a.level, a.instructions)
-    out = gate(out, a.min_confidence)
-    emit(out, 3 if out.get("action") == "escalate" else 0)
+    one(a, q_score(a.question, a.level, a.instructions))
 
 
 def cmd_yesno(a):
-    state = read_state(a)
-    out = do_noul(resolve(a.model) if a.model else default_model(), state, a.statement, a.instructions)
-    out = gate(out, a.min_confidence)
-    emit(out, 3 if out.get("action") == "escalate" else 0)
+    one(a, q_noul(a.statement, a.instructions))
 
 
 def cmd_ask(a):
-    """Batch fan-out: JSON {state, questions:[...]} on stdin or --file."""
+    """Batch. Accepts TypeSafe-native {"state", "questions":{id:{...}}} or the list form."""
     spec = json.load(open(a.file)) if a.file else json.load(sys.stdin)
-    model = resolve(a.model) if a.model else default_model()
     qs = spec["questions"]
-    with cf.ThreadPoolExecutor(max_workers=a.parallel) as ex:
-        results = list(ex.map(lambda q: gate(run_question(model, spec["state"], q, a.debias), a.min_confidence), qs))
-    escalate = any(r.get("action") == "escalate" for r in results)
-    emit({"model": model, "results": results}, 3 if escalate else 0)
+    if isinstance(qs, list):
+        conv = {}
+        for q in qs:
+            t = q.get("type", "choice")
+            if t == "choice":
+                conv[q["id"]] = q_choice(q["question"], q["options"], q.get("instructions"))
+            elif t == "score":
+                conv[q["id"]] = q_score(q["question"], q["levels"], q.get("instructions"))
+            else:
+                conv[q["id"]] = q_noul(q.get("statement") or q["question"], q.get("instructions"))
+        qs = conv
+    res = call(spec["state"], qs, a.model, spec.get("files") or spec.get("images"))
+    results = [gate(tidy(k, v), a.min_confidence) for k, v in res["answers"].items()]
+    esc = any(r.get("action") == "escalate" for r in results)
+    emit({"model": running_info().get("key") or a.model or default_key(), "results": results,
+          "usage": res.get("usage")}, 3 if esc else 0)
 
 
 def cmd_panel(a):
-    """Several models vote; probabilities are averaged; agreement is reported."""
+    """Several decision models vote on one choice; probabilities are averaged."""
     state = read_state(a)
-    models = [resolve(m) for m in (a.models.split(",") if a.models else [default_model(), "gemma3:4b", "granite3.3:8b"])]
-    installed = installed_models()
-    models = [m for m in models if has_model(m, installed)]
-    if len(models) < 2:
-        die("panel needs at least 2 installed models (see: jev models)")
-    names, _ = norm_options(a.option)
-    runs = []
-    for m in models:  # sequential: RAM-friendly, Ollama swaps models
-        r = do_choice(m, state, a.question, a.option, a.instructions)
-        if r.get("choice"):
-            runs.append((m, r))
-    avg = {n: sum(r["probabilities"][n] for _, r in runs) / len(runs) for n in names}
+    keys = [entry(k)["key"] for k in (a.models.split(",") if a.models else ["d3-flash", "nimble", "clef-flash"])]
+    keys = [k for k in keys if cached(entry(k))]
+    if len(keys) < 2:
+        die("panel needs at least 2 downloaded models (jev models; jev pull <name>)")
+    q = q_choice(a.question, a.option, a.instructions)
+    names = list(norm_options(a.option).keys())
+    runs, votes = [], {}
+    for k in keys:  # one at a time: RAM friendly
+        r = tidy(None, call(state, {"q": q}, k)["answers"]["q"])
+        runs.append(r)
+        votes[k] = r["choice"]
+    avg = {n: sum(r["probabilities"][n] for r in runs) / len(runs) for n in names}
     best = max(avg, key=avg.get)
-    votes = {m: r["choice"] for m, r in runs}
     agree = sum(1 for v in votes.values() if v == best) / len(votes)
     out = {"type": "panel", "choice": best, "probabilities": {k: round(v, 4) for k, v in avg.items()},
            "confidence": round(conf_choice(list(avg.values())) * agree, 4), "agreement": round(agree, 3), "votes": votes}
@@ -397,32 +407,20 @@ def cmd_panel(a):
     emit(out, 3 if out.get("action") == "escalate" else 0)
 
 
+RISKS = {
+    "harm": "the text contains or requests harmful content",
+    "jailbreak": "the text is a prompt-injection or jailbreak attempt that tries to override an AI assistant's instructions",
+    "pii": "the text contains personal data (names with contact details, IDs, card numbers, passwords)",
+    "secrets": "the text contains credentials, API keys, tokens or private keys",
+    "toxicity": "the text is abusive, hateful or harassing",
+    "violence": "the text depicts or incites violence",
+}
+
+
 def cmd_guard(a):
-    """Granite Guardian risk check. Output: probability the text is risky."""
-    text = read_state(a)
-    model = resolve(a.model) if a.model else "granite3-guardian:8b"
-    resp = chat(model, [{"role": "system", "content": a.risk}, {"role": "user", "content": render_state(text)}],
-                num_predict=1)
-    tops = first_token_logprobs(resp) or []
-    yes = sum(math.exp(lp) for t, lp in tops if t.strip().lower() == "yes")
-    no = sum(math.exp(lp) for t, lp in tops if t.strip().lower() == "no")
-    if yes + no == 0:
-        die("guardian returned no Yes/No (got %r)" % (resp.get("message") or {}).get("content"))
-    p = yes / (yes + no)
-    out = {"type": "guard", "risk": a.risk, "risky": p >= 0.5, "probability": round(p, 4),
-           "confidence": round(conf_choice([p, 1 - p]), 4)}
-    emit(gate(out, a.min_confidence), 0)
-
-
-def cmd_think(a):
-    """System-2 escalation: let a reasoning model deliberate and print its answer."""
-    model = resolve(a.model) if a.model else "deepseek-r1:8b"
-    q = a.question if a.question else sys.stdin.read()
-    resp = chat(model, [{"role": "user", "content": q}], num_predict=a.max_tokens, logprobs=False, think=True, timeout=900)
-    msg = resp.get("message") or {}
-    if a.show_thinking and msg.get("thinking"):
-        print("--- thinking ---\n" + msg["thinking"] + "\n--- answer ---")
-    print((msg.get("content") or "").strip())
+    """Guardrail check: probability that a risk is present in the text."""
+    desc = RISKS.get(a.risk, a.risk)
+    one(a, q_noul("Is the following true? " + desc[0].upper() + desc[1:] + ".", a.instructions))
 
 
 BENCH = [
@@ -446,168 +444,166 @@ BENCH = [
 
 
 def cmd_bench(a):
-    models = [resolve(m) for m in a.models.split(",")] if a.models else [default_model()]
-    opts = ["billing", "technical", "account", "sales"]
-    if not a.bare:  # descriptions matter a lot: bare names were ambiguous (sales vs billing)
-        opts = {"billing": "charges, invoices, payments, refunds", "technical": "bugs, crashes, errors, performance",
-                "account": "login, profile, permissions, data deletion", "sales": "pricing, demos, plans, evaluation"}
+    opts = {"billing": "charges, invoices, payments, refunds", "technical": "bugs, crashes, errors, performance",
+            "account": "login, profile, permissions, data deletion", "sales": "pricing, demos, plans, evaluation"}
+    if a.bare:
+        opts = list(opts)
+    keys = [entry(k)["key"] for k in a.models.split(",")] if a.models else [running_info().get("key") or default_key()]
     rows = []
-    for m in models:
-        ok, confs, hi_ok, hi_n, t0 = 0, [], 0, 0, time.time()
-        chat(m, [{"role": "user", "content": "hi"}], num_predict=1, logprobs=False)  # warm-up
+    for k in keys:
+        ensure(k)
+        ok, confs, hi_n, hi_ok = 0, [], 0, 0
         t0 = time.time()
         for text, gold in BENCH:
-            r = do_choice(m, text, "Which team should handle this customer message?", opts, debias=a.debias)
-            good = r.get("choice") == gold
-            c = r.get("confidence") or 0
+            r = tidy(None, call(text, {"q": q_choice("Which team should handle this customer message?", opts)}, k)["answers"]["q"])
+            good = r["choice"] == gold
             ok += good
-            confs.append(c)
-            if c >= 0.7:
+            confs.append(r["confidence"])
+            if r["confidence"] >= 0.7:
                 hi_n += 1
                 hi_ok += good
-        ms = (time.time() - t0) * 1000 / len(BENCH)
-        rows.append({"model": m, "accuracy": round(ok / len(BENCH), 3), "mean_confidence": round(sum(confs) / len(confs), 3),
-                     "accuracy_when_conf>=0.7": round(hi_ok / hi_n, 3) if hi_n else None, "answered_conf>=0.7": hi_n,
-                     "ms_per_decision": round(ms)})
+        rows.append({"model": k, "accuracy": round(ok / len(BENCH), 3),
+                     "mean_confidence": round(sum(confs) / len(confs), 3),
+                     "accuracy_when_conf>=0.7": round(hi_ok / hi_n, 3) if hi_n else None,
+                     "ms_per_decision": round((time.time() - t0) * 1000 / len(BENCH))})
     emit({"items": len(BENCH), "results": rows})
 
 
 def cmd_models(a):
     r = ram_gb()
-    installed = installed_models() if server_up() else []
-    print("This Mac: %.0f GB RAM   default model: %s\n" % (r, default_model()))
-    print("%-34s %6s %5s  %-10s %s" % ("MODEL", "SIZE", "RAM", "TIER", "WHAT IT IS FOR"))
+    run = running_info().get("key") if healthy() else None
+    print("This machine: %.0f GB RAM    default: %s    running: %s\n" % (r, default_key(), run or "—"))
+    print("%-3s %-11s %-30s %6s %7s %5s  %-9s %s" % ("", "KEY", "MODEL", "INDEX", "SIZE", "RAM", "STATUS", "WHAT IT IS FOR"))
     for m in CATALOG:
-        mark = "●" if has_model(m["id"], installed) else " "
-        fit = "" if r >= m["ram"] else "  (tight on this Mac)"
-        print("%s %-32s %4.1fGB %3dGB  %-10s %s%s" % (mark, m["id"], m["gb"], m["ram"], m["tier"], m["why"], fit))
-    print("\nSystem-2 companions (for `jev think`):")
-    for m in THINKERS:
-        mark = "●" if has_model(m["id"], installed) else " "
-        print("%s %-32s %4.1fGB %3dGB" % (mark, m["id"], m["gb"], m["ram"]))
-    print("\n● = installed. Shortcuts: " + ", ".join("%s=%s" % kv for kv in ALIASES.items()))
+        st = "running" if m["key"] == run else ("downloaded" if cached(m) else "")
+        fit = "" if r >= m["ram"] else " (needs %d GB)" % m["ram"]
+        star = "★" if m["key"] == default_key() else " "
+        print("%-3s %-11s %-30s %6.1f %5.1fGB %3dGB  %-10s %s%s" % (star, m["key"], m["name"], m["index"], m["gb"], m["ram"], st, m["why"], fit))
+    print("\nINDEX = Decision Index 0.3 (higher is better; hosted TypeSafe Jev 1.13 = 60.1).")
+    print("Shortcuts: " + ", ".join("%s→%s" % kv for kv in ALIASES.items()))
 
 
-def ollama_bin():
-    p = shutil.which("ollama")
-    for c in ("/opt/homebrew/bin/ollama", "/usr/local/bin/ollama", "/Applications/Ollama.app/Contents/Resources/ollama"):
-        if not p and os.path.exists(c):
-            p = c
-    return p
-
-
-def start_server():
-    if server_up():
-        return True
-    ob = ollama_bin()
-    if not ob:
-        return False
-    if shutil.which("brew") and "/homebrew/" in ob:
-        subprocess.call(["brew", "services", "start", "ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(20):
-        if server_up():
-            return True
-        time.sleep(0.5)
-    subprocess.Popen([ob, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    for _ in range(40):
-        if server_up():
-            return True
-        time.sleep(0.5)
-    return False
-
-
-def pull(tag):
-    ob = ollama_bin()
-    if not ob:
-        die("ollama is not installed. Run: jev setup")
-    if not start_server():
-        die("could not start the Ollama server")
-    return subprocess.call([ob, "pull", tag])
+def fetch_runtime(update=False):
+    if llama_server_bin() and not update and glob.glob(os.path.join(SHARE_DIR, "llama-*")):
+        return
+    sysname, mach = sys.platform, platform.machine().lower()
+    if sysname == "darwin":
+        needle = "macos-arm64.tar.gz" if "arm" in mach else "macos-x64.tar.gz"
+    else:
+        needle = "ubuntu-x64.tar.gz"
+    print("→ looking up the latest llama.cpp release…")
+    rel = json.loads(urllib.request.urlopen("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", timeout=30).read())
+    asset = next((x for x in rel["assets"] if x["name"].endswith(needle) and "bin" in x["name"]), None)
+    if not asset:
+        die("no prebuilt llama.cpp for this platform; build from source and set JEV_LLAMA_SERVER")
+    dest = os.path.join(SHARE_DIR, "llama-" + rel["tag_name"])
+    if os.path.isdir(dest) and glob.glob(os.path.join(dest, "**", "llama-server"), recursive=True):
+        return
+    os.makedirs(dest, exist_ok=True)
+    print("→ downloading %s (%.0f MB)" % (asset["name"], asset["size"] / 1e6))
+    with tempfile.TemporaryDirectory() as tmp:
+        arc = os.path.join(tmp, "llama.tar.gz")
+        urllib.request.urlretrieve(asset["browser_download_url"], arc)
+        if subprocess.call(["tar", "-xzf", arc, "-C", dest]) != 0:
+            die("could not unpack the llama.cpp archive")
+    print("✓ runtime in " + dest)
 
 
 def cmd_setup(a):
-    if not ollama_bin():
-        if not shutil.which("brew"):
-            die("Ollama is missing and Homebrew is not installed. Get Ollama from https://ollama.com/download")
-        print("Installing Ollama with Homebrew…")
-        if subprocess.call(["brew", "install", "ollama"]) != 0:
-            die("brew install ollama failed")
-    if not start_server():
-        die("could not start the Ollama server (try: ollama serve)")
-    model = resolve(a.model) if a.model else default_model()
-    if not has_model(model, installed_models()):
-        print("Pulling %s …" % model)
-        if pull(model) != 0:
-            die("pull failed")
+    fetch_runtime(a.update)
+    m = entry(a.model) if a.model else entry(default_key())
     os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
     cfg = load_config()
-    cfg["model"] = model
+    cfg["model"] = m["key"]
     with open(CONFIG, "w") as f:
         json.dump(cfg, f, indent=2)
-    print("Ready. Default model: %s\nTry: jev yesno --state 'The build is green' --statement 'The tests pass'" % model)
+    if a.no_pull:
+        print("Runtime ready. Download a model with: jev pull %s" % m["key"])
+        return
+    print("→ model: %s (%.1f GB, %s)" % (m["name"], m["gb"], m["license"]))
+    start_server(m)
+    print("✓ ready. Try:  jev yesno -s 'The customer is angry' --state 'This is the third time I write. Unacceptable!'")
 
 
 def cmd_pull(a):
-    tags = [resolve(t) for t in a.models]
-    if a.all:
-        tags = [m["id"] for m in CATALOG]
-    for t in tags:
-        print("→ " + t)
-        if pull(t) != 0:
-            die("pull failed: " + t)
+    fetch_runtime()
+    keys = [m["key"] for m in CATALOG] if a.all else [entry(k)["key"] for k in a.models]
+    if not keys:
+        die("name a model, e.g. jev pull d3-mini  (see: jev models)")
+    prev = running_info().get("key") if healthy() else None
+    for k in keys:
+        m = entry(k)
+        if cached(m):
+            print("✓ %s already downloaded" % k)
+            continue
+        print("→ %s (%.1f GB)" % (k, m["gb"]))
+        start_server(m)
+    if prev and prev != keys[-1]:
+        start_server(entry(prev), quiet=True)
+
+
+def cmd_serve(a):
+    fetch_runtime()
+    m = entry(a.model) if a.model else entry(default_key())
+    start_server(m)
+    print("✓ %s serving on %s  (POST /v1/systemone, TypeSafe-compatible)" % (m["key"], URL))
+
+
+def cmd_stop(a):
+    stop_server()
+    print("stopped")
+
+
+def cmd_status(a):
+    info = running_info()
+    print(json.dumps({"url": URL, "up": healthy(), "model": info.get("key"), "pid": info.get("pid"),
+                      "runtime": llama_server_bin()}, indent=2))
 
 
 def cmd_doctor(a):
     ok = True
-    ob = ollama_bin()
-    print("ollama binary : %s" % (ob or "MISSING  → jev setup"))
-    up = server_up()
-    print("server        : %s" % ("up at " + HOST if up else "DOWN     → jev setup"))
-    inst = installed_models() if up else []
-    r = ram_gb()
-    print("memory        : %.0f GB  (default model: %s)" % (r, default_model()))
-    free = shutil.disk_usage(os.path.expanduser("~")).free / 2 ** 30
-    print("disk free     : %.0f GB" % free)
-    mine = [m["id"] for m in CATALOG if has_model(m["id"], inst)]
-    print("decision models installed: %s" % (", ".join(mine) or "none  → jev pull default"))
-    if up and has_model(default_model(), inst):
+    exe = llama_server_bin()
+    print("runtime       : %s" % (exe or "MISSING  → jev setup"))
+    ok &= bool(exe)
+    print("memory        : %.0f GB  (default model: %s)" % (ram_gb(), default_key()))
+    print("disk free     : %.0f GB" % (shutil.disk_usage(HOME).free / 2 ** 30))
+    have = [m["key"] for m in CATALOG if cached(m)]
+    print("downloaded    : %s" % (", ".join(have) or "none  → jev setup"))
+    up = healthy()
+    print("server        : %s" % (("up, model=%s" % running_info().get("key")) if up else "down (auto-starts on first decision)"))
+    if up:
         t = time.time()
         try:
-            res = do_noul(default_model(), "The sky is blue.", "The sky is blue.")
-            print("self-test     : noul=%.3f conf=%.3f in %d ms  %s" % (
-                res.get("noul") or -1, res.get("confidence") or -1, (time.time() - t) * 1000,
-                "(logprobs OK)" if res.get("label_mass", 0) > 0.5 else "(NO LOGPROBS — update Ollama: brew upgrade ollama)"))
+            r = call("The sky is blue.", {"q": q_noul("The sky is blue.")})
+            print("self-test     : noul=%.3f in %d ms" % (r["answers"]["q"]["noul"], (time.time() - t) * 1000))
         except SystemExit:
             ok = False
-    else:
-        ok = False
-    sys.exit(0 if ok and ob and up else 1)
+    sys.exit(0 if ok else 1)
 
 
 # --------------------------------------------------------------------------
 # Claude Code PreToolUse hook: conservative permission gate (opt-in).
 # --------------------------------------------------------------------------
 HARD_ASK = [
-    r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b", r"\bsudo\b", r"\bgit\s+push\b.*(--force|-f\b)",
-    r"\bgit\s+reset\s+--hard\b", r"\bcurl\b.*\|\s*(sh|bash|zsh)\b", r"\bchmod\s+-R\b", r"\bmkfs\b", r"\bdd\s+if=",
-    r">\s*/dev/(sd|disk)", r"\bdrop\s+(table|database)\b", r"\bnpm\s+publish\b", r"\bwrangler\s+(deploy|delete)\b",
-    r"\bgit\s+push\b", r"\.env\b", r"\bkeychain\b|\bsecurity\s+find-", r"\bssh\b|\bscp\b",
+    r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b", r"\bsudo\b", r"\bgit\s+push\b", r"\bgit\s+reset\s+--hard\b",
+    r"\bcurl\b.*\|\s*(sh|bash|zsh)\b", r"\bchmod\s+-R\b", r"\bmkfs\b", r"\bdd\s+if=", r">\s*/dev/(sd|disk)",
+    r"\bdrop\s+(table|database)\b", r"\bnpm\s+publish\b", r"\bwrangler\s+(deploy|delete)\b", r"\.env\b",
+    r"\bkeychain\b|\bsecurity\s+find-", r"\bssh\b|\bscp\b",
 ]
 SAFE_READ = re.compile(r"^\s*(ls|cat|head|tail|wc|pwd|echo|grep|rg|find|stat|file|which|git\s+(status|log|diff|show|branch)|"
                        r"sed\s+-n|awk|sort|uniq|jq|tree|du|df)\b")
 
 
-def hook_decision(reason, allow=False):
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                                   "permissionDecision": "allow" if allow else "ask",
-                                   "permissionDecisionReason": reason}}
+def hook_out(reason, allow=False):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                             "permissionDecision": "allow" if allow else "ask",
+                                             "permissionDecisionReason": reason}}))
 
 
 def cmd_hook(a):
     if a.print_config:
-        me = os.path.abspath(sys.argv[0])
         print(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-            {"type": "command", "command": me + " hook", "timeout": 20}]}]}}, indent=2))
+            {"type": "command", "command": os.path.abspath(sys.argv[0]) + " hook", "timeout": 30}]}]}}, indent=2))
         return
     try:
         ev = json.load(sys.stdin)
@@ -617,53 +613,54 @@ def cmd_hook(a):
         sys.exit(0)
     cmd = (ev.get("tool_input") or {}).get("command", "")
     if any(re.search(p, cmd, re.I) for p in HARD_ASK):
-        print(json.dumps(hook_decision("jev: matches a never-auto-approve pattern; asking you.")))
+        hook_out("jev: matches a never-auto-approve pattern; asking you.")
         sys.exit(0)
-    if "&&" not in cmd and ";" not in cmd and "|" not in cmd and ">" not in cmd and SAFE_READ.match(cmd):
-        print(json.dumps(hook_decision("jev: plain read-only command.", allow=True)))
+    if not re.search(r"&&|;|\||>|\$\(|`", cmd) and SAFE_READ.match(cmd):
+        hook_out("jev: plain read-only command.", allow=True)
         sys.exit(0)
-    if not server_up() or not has_model(default_model(), installed_models()):
-        sys.exit(0)  # no local model: stay out of the way, normal prompt applies
+    if not healthy():  # never block on a cold model start inside a hook
+        sys.exit(0)
     try:
-        r = do_choice(default_model(), {"shell_command": cmd, "cwd": ev.get("cwd", "")},
-                      "What is the worst effect of running this command?",
-                      {"read_only": "only reads or prints; changes nothing",
-                       "local_edit": "creates or edits files inside the project directory",
-                       "risky": "changes things outside the project, installs software, uses the network to send data, or is hard to undo",
-                       "destructive": "deletes data, overwrites history, or could cause loss"}, debias=True)
-    except SystemExit:
+        res = http("/v1/systemone", {
+            "state": {"shell_command": cmd, "cwd": ev.get("cwd", "")},
+            "questions": {"effect": q_choice("What is the worst effect of running this command?", {
+                "read_only": "only reads or prints; changes nothing",
+                "local_edit": "creates or edits files inside the project directory",
+                "risky": "changes things outside the project, installs software, sends data over the network, or is hard to undo",
+                "destructive": "deletes data, overwrites history, or could cause loss"})}}, timeout=20)
+        r = tidy(None, res["answers"]["effect"])
+    except Exception:
         sys.exit(0)
-    c = r.get("choice")
-    if c == "read_only" and r["probabilities"]["read_only"] >= a.threshold and r["confidence"] >= 0.7:
-        print(json.dumps(hook_decision("jev: read-only (p=%.2f)." % r["probabilities"]["read_only"], allow=True)))
-    elif c in ("risky", "destructive"):
-        print(json.dumps(hook_decision("jev: judged %s (p=%.2f); asking you." % (c, r["probabilities"][c]))))
+    p = r["probabilities"]
+    if r["choice"] == "read_only" and p["read_only"] >= a.threshold and r["confidence"] >= 0.7:
+        hook_out("jev: read-only (p=%.2f)." % p["read_only"], allow=True)
+    elif r["choice"] in ("risky", "destructive"):
+        hook_out("jev: judged %s (p=%.2f); asking you." % (r["choice"], p[r["choice"]]))
     sys.exit(0)
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="jev", description="Local System One decision engine for Claude Code.")
+    p = argparse.ArgumentParser(prog="jev", description="Local System One decision models for Claude Code.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp, state=True):
         if state:
             sp.add_argument("--state", help="the text/JSON to judge (or pipe it on stdin)")
             sp.add_argument("--state-file")
-        sp.add_argument("--model", help="tag or shortcut (tiny, fast, default, best)")
-        sp.add_argument("--instructions", help="extra standing instructions for the decision")
+        sp.add_argument("--model", help="catalog key or shortcut (see: jev models)")
+        sp.add_argument("--instructions", help="extra standing instructions for the question")
         sp.add_argument("--min-confidence", type=float, help="below this: action=escalate, exit code 3")
 
-    s = sub.add_parser("choose", help="pick one option, with probabilities and confidence")
+    s = sub.add_parser("choose", help="pick one option: probabilities + confidence")
     common(s)
     s.add_argument("--question", "-q", required=True)
-    s.add_argument("--option", "-o", action="append", required=True, help="repeat; use name=description for hints")
-    s.add_argument("--debias", action="store_true", help="also run reversed option order and average (2x cost)")
+    s.add_argument("--option", "-o", action="append", required=True, help="repeat; name=description gives a hint")
     s.set_defaults(fn=cmd_choose)
 
-    s = sub.add_parser("score", help="rate on ordered levels (0..n-1) -> expected score")
+    s = sub.add_parser("score", help="rate on ordered levels (lowest first) -> expected score")
     common(s)
     s.add_argument("--question", "-q", required=True)
-    s.add_argument("--level", "-l", action="append", required=True, help="repeat in order, lowest first")
+    s.add_argument("--level", "-l", action="append", required=True)
     s.set_defaults(fn=cmd_score)
 
     s = sub.add_parser("yesno", help="probability that a statement is true of the state")
@@ -671,50 +668,47 @@ def build_parser():
     s.add_argument("--statement", "-s", required=True)
     s.set_defaults(fn=cmd_yesno)
 
-    s = sub.add_parser("ask", help="batch: many typed questions about one state, in parallel (JSON on stdin)")
+    s = sub.add_parser("ask", help="batch: many typed questions about one state (JSON on stdin; TypeSafe format works)")
     common(s, state=False)
     s.add_argument("--file")
-    s.add_argument("--parallel", type=int, default=3)
-    s.add_argument("--debias", action="store_true")
     s.set_defaults(fn=cmd_ask)
 
-    s = sub.add_parser("panel", help="ensemble several local models on one choice")
+    s = sub.add_parser("panel", help="ensemble of decision models on one choice")
     common(s)
-    s.add_argument("--models", help="comma list; default: default + gemma3:4b + granite3.3:8b")
+    s.add_argument("--models", help="comma list; default d3-flash,nimble,clef-flash")
     s.add_argument("--question", "-q", required=True)
     s.add_argument("--option", "-o", action="append", required=True)
     s.set_defaults(fn=cmd_panel)
 
-    s = sub.add_parser("guard", help="Granite Guardian risk probability (harm, jailbreak, social_bias, violence…)")
+    s = sub.add_parser("guard", help="guardrail: probability a risk is present (harm, jailbreak, pii, secrets, toxicity, violence, or free text)")
     common(s)
     s.add_argument("--risk", default="harm")
     s.set_defaults(fn=cmd_guard)
 
-    s = sub.add_parser("think", help="System-2 escalation: slow reasoning model, prints the answer")
-    s.add_argument("question", nargs="?")
-    s.add_argument("--model")
-    s.add_argument("--max-tokens", type=int, default=4096)
-    s.add_argument("--show-thinking", action="store_true")
-    s.set_defaults(fn=cmd_think)
-
-    s = sub.add_parser("bench", help="accuracy / confidence / latency of models on a built-in routing set")
-    s.add_argument("--models", help="comma list; default: the default model")
-    s.add_argument("--bare", action="store_true", help="options without descriptions (shows how much hints matter)")
-    s.add_argument("--debias", action="store_true", help="reversed-order averaging, as `choose --debias`")
+    s = sub.add_parser("bench", help="accuracy / confidence / latency on a built-in routing set")
+    s.add_argument("--models")
+    s.add_argument("--bare", action="store_true", help="options without descriptions")
     s.set_defaults(fn=cmd_bench)
 
-    sub.add_parser("models", help="the ten decision models and what fits this Mac").set_defaults(fn=cmd_models)
-    s = sub.add_parser("pull", help="download models (tags or shortcuts)")
+    sub.add_parser("models", help="the ten decision models, Decision Index, what fits this Mac").set_defaults(fn=cmd_models)
+    s = sub.add_parser("pull", help="download model(s)")
     s.add_argument("models", nargs="*")
-    s.add_argument("--all", action="store_true", help="every model in the catalog (~50 GB)")
+    s.add_argument("--all", action="store_true")
     s.set_defaults(fn=cmd_pull)
-    s = sub.add_parser("setup", help="install Ollama, start it, pull the default model")
+    s = sub.add_parser("setup", help="fetch the llama.cpp runtime, pick a default model, download it, start serving")
     s.add_argument("--model")
+    s.add_argument("--update", action="store_true", help="re-fetch the newest llama.cpp (new decision archs land often)")
+    s.add_argument("--no-pull", action="store_true", help="runtime only")
     s.set_defaults(fn=cmd_setup)
-    sub.add_parser("doctor", help="check the install and run a self-test").set_defaults(fn=cmd_doctor)
+    s = sub.add_parser("serve", help="(re)start the local /v1/systemone server with a model")
+    s.add_argument("model", nargs="?")
+    s.set_defaults(fn=cmd_serve)
+    sub.add_parser("stop", help="stop the local server").set_defaults(fn=cmd_stop)
+    sub.add_parser("status", help="server state").set_defaults(fn=cmd_status)
+    sub.add_parser("doctor", help="check install, run a self-test").set_defaults(fn=cmd_doctor)
 
-    s = sub.add_parser("hook", help="Claude Code PreToolUse permission gate (reads the event JSON on stdin)")
-    s.add_argument("--print-config", action="store_true", help="print the settings.json snippet and exit")
+    s = sub.add_parser("hook", help="Claude Code PreToolUse permission gate (event JSON on stdin)")
+    s.add_argument("--print-config", action="store_true")
     s.add_argument("--threshold", type=float, default=0.9)
     s.set_defaults(fn=cmd_hook)
     return p
@@ -722,18 +716,18 @@ def build_parser():
 
 def main():
     a = build_parser().parse_args()
-    if getattr(a, "option", None):  # name=description sugar
-        opts = {}
-        for o in a.option:
-            k, _, v = o.partition("=")
-            opts[k] = v
-        a.option = opts if any(opts.values()) else list(opts.keys())
+    if getattr(a, "option", None):
+        o = {}
+        for x in a.option:
+            k, _, v = x.partition("=")
+            o[k] = v or None
+        a.option = o
     if getattr(a, "level", None):
-        lv = {}
-        for o in a.level:
-            k, _, v = o.partition("=")
-            lv[k] = v
-        a.level = lv if any(lv.values()) else list(lv.keys())
+        o = {}
+        for x in a.level:
+            k, _, v = x.partition("=")
+            o[k] = v or None
+        a.level = o if any(o.values()) else list(o)
     a.fn(a)
 
 

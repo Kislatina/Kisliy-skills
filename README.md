@@ -9,7 +9,7 @@ A collection of [Claude Code](https://code.claude.com/docs/en/skills) skills by 
 | [`offstage`](./offstage) | Run a macOS app on a hidden virtual display, screenshot it and drive its UI — without touching your screen, cursor, or focus. | [`offstage/SKILL.md`](./offstage/SKILL.md) |
 | [`motion-film`](./motion-film) | Make a finished, showreel-grade motion-graphics video entirely in code — procedural visuals, synthesized score, mastered MP4. | [`motion-film/SKILL.md`](./motion-film/SKILL.md) |
 | [`nullnote`](./nullnote) | Author `.nn` (NullNote) files — interactive documents with callouts, charts, diagrams, and buttons that run shell commands. | [`nullnote/SKILL.md`](./nullnote/SKILL.md) |
-| [`local-jev`](./local-jev) | A local, offline analogue of the Jev decision model — typed choice / score / yes-no decisions with probabilities and confidence, powered by 10 local models via Ollama. | [`local-jev/SKILL.md`](./local-jev/SKILL.md) |
+| [`local-jev`](./local-jev) | Local analogue of TypeSafe's Jev: open decision models (vLLM-SR d3, Perplexity Decider, Clef, Kev, Laya…) serving typed choice / score / yes-no decisions with calibrated probabilities through llama.cpp's `/v1/systemone`. | [`local-jev/SKILL.md`](./local-jev/SKILL.md) |
 
 ### offstage
 
@@ -39,9 +39,11 @@ Supports: callouts, charts, diagrams, data blocks, and buttons that run real she
 
 ### local-jev
 
-A local [System One](https://docs.typesafe.ai/concepts/system-one)-style decision engine. Claude Code gets fast, private, free typed decisions — `choose`, `score`, `yesno`, batch `ask`, multi-model `panel`, `guard`, and a `think` escalation — each with per-option probabilities and a confidence to gate on. Ten curated local models (Qwen3, Gemma 3, Phi-4, Llama 3.2, Granite, Granite Guardian), one-line setup: `jev setup`.
+A local [System One](https://docs.typesafe.ai/concepts/system-one) decision engine. Decision models don't write text: one forward pass returns a typed answer — `choice`, `score` or `noul` — with calibrated probabilities and a confidence, in tens of milliseconds. The skill installs the newest llama.cpp runtime, downloads a model sized for your Mac, and gives Claude Code a CLI (`jev choose | score | yesno | ask | panel | guard | bench | hook`) on top of the TypeSafe-compatible `POST /v1/systemone` API.
 
-Requires: macOS or Linux, Python 3.9+, [Ollama](https://ollama.com) (installed by `jev setup`).
+Ten ranked models from the [Decision Index](https://huggingface.co/spaces/multimodalart/jev-decision-index): vLLM-SR d3 27B (66.3, above hosted Jev 1.13 at 60.1), Perplexity Decider v1.1 27B, d3-flash 9B (default for 16 GB), Bespoke Nimble v3, d3-mini 4B, Cloudflare clef-flash, Kev 9B, LiquidAI d1-3B, d3-nano, Laya. One-line setup: `jev setup`.
+
+Requires: macOS (arm64/x64) or Linux x64, Python 3.9+. Everything is fetched by `jev setup`.
 
 ## Install
 
