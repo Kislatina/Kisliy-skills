@@ -10,6 +10,7 @@ A collection of [Claude Code](https://code.claude.com/docs/en/skills) skills by 
 | [`motion-film`](./motion-film) | Make a finished, showreel-grade motion-graphics video entirely in code — procedural visuals, synthesized score, mastered MP4. | [`motion-film/SKILL.md`](./motion-film/SKILL.md) |
 | [`nullnote`](./nullnote) | Author `.nn` (NullNote) files — interactive documents with callouts, charts, diagrams, and buttons that run shell commands. | [`nullnote/SKILL.md`](./nullnote/SKILL.md) |
 | [`local-jev`](./local-jev) | Local analogue of TypeSafe's Jev: open decision models (vLLM-SR d3, Perplexity Decider, Clef, Kev, Laya…) serving typed choice / score / yes-no decisions with calibrated probabilities through llama.cpp's `/v1/systemone`. | [`local-jev/SKILL.md`](./local-jev/SKILL.md) |
+| [`terse-updates`](./terse-updates) | Shrinks Claude's in-progress status lines between tool calls to 2–5 words. On by default via a `UserPromptSubmit` hook; the final answer stays full. | [`terse-updates/SKILL.md`](./terse-updates/SKILL.md) |
 
 ### offstage
 
@@ -37,6 +38,10 @@ Plain-text `.nn` format: YAML frontmatter + extended Markdown. Rendered live by 
 
 Supports: callouts, charts, diagrams, data blocks, and buttons that run real shell commands. See [`nullnote/SKILL.md`](./nullnote/SKILL.md).
 
+### terse-updates
+
+No more paragraph-long narration between tool calls: every status line is 2–5 words («Правлю цвета карты.»). A skill alone loads only when the model asks for it, so `setup.sh` registers a `UserPromptSubmit` hook that feeds the rule into every prompt — on by default, survives compaction. The site installer runs `setup.sh` for you; `setup.sh --off` removes the hook, `TERSE_UPDATES=0` skips it for one session.
+
 ### local-jev
 
 A local [System One](https://docs.typesafe.ai/concepts/system-one) decision engine. Decision models don't write text: one forward pass returns a typed answer — `choice`, `score` or `noul` — with calibrated probabilities and a confidence, in tens of milliseconds. The skill installs the newest llama.cpp runtime, downloads a model sized for your Mac, and gives Claude Code a CLI (`jev choose | score | yesno | ask | panel | guard | bench | hook`) on top of the TypeSafe-compatible `POST /v1/systemone` API.
@@ -54,6 +59,7 @@ cp -R offstage ~/.claude/skills/offstage
 cp -R motion-film ~/.claude/skills/motion-film
 cp -R nullnote ~/.claude/skills/nullnote
 cp -R local-jev ~/.claude/skills/local-jev
+cp -R terse-updates ~/.claude/skills/terse-updates && sh ~/.claude/skills/terse-updates/setup.sh
 ```
 
 Or symlink them so updates come in with `git pull`:
